@@ -1,0 +1,9 @@
+# Cached copies of third-party web pages: never commit
+output/cache/
+# Generated results (contain data derived from OTA listings); regenerate with `python3 run.py`
+output/*.csv
+output/*.json
+output/*.html
+__pycache__/
+*.pyc
+.DS_Store

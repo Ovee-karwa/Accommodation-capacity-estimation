@@ -18,8 +18,9 @@ def classify(p) -> str:
         return "hostel"
     if "camp" in k or re.search(r"\bcamp|tent", n):
         return "campsite / tents"
-    if re.search(r"home ?stay|guest ?house|bungalow|cottage|villa|stayvista|apartment|\bbnb\b|b ?& ?b", n) \
-            or any(x in k for x in ("guest_house", "apartment", "chalet", "bed_and_breakfast", "private_guest_room", "cottage")):
+    if re.search(r"home ?stay|guest ?house|bungalow|cottage|villa|stayvista|apartment|\bbnb\b|b ?& ?b|\d ?bhk", n) \
+            or any(x in k for x in ("guest_house", "guest house", "apartment", "chalet", "bed_and_breakfast",
+                                    "private_guest_room", "cottage", "villa", "homestay")):
         return "guest house / homestay"
     if "oyo" in p["sources"] or re.search(r"\boyo\b|super hotel o\b|collection o\b|townhouse|capital o\b", n):
         return "budget hotel (0-2 star)"  # OYO-branded: economy whatever an OTA star tag says

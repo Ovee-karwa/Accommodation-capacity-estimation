@@ -6,6 +6,9 @@ rooms, beds, url
 import json
 import os
 import time
+from pathlib import Path
+
+import requests
 import re
 from collections import deque
 from urllib.parse import urljoin, urlparse
@@ -20,7 +23,7 @@ RADIUS_M = config.RADIUS_KM * 1000
 def rec(**kw):
     base = dict(source=None, source_id=None, name=None, kind=None, stars=None, lat=None,
                 lon=None, address=None, locality=None, phone=None, rooms=None, beds=None,
-                url=None)
+                url=None, approx=False, ring_km=None)
     base.update(kw)
     return base
 
@@ -203,6 +206,118 @@ def cleartrip():
     return out
 
 
+# ---------------------------------------------------------------- Browser-collected lists
+# The OTAs' full result lists only load inside a real browser as you scroll.
+# Those lists were collected in a browser into browser_lists/*.tsv; here we
+# fetch each property's public detail page for its coordinates.
+LISTS = Path(__file__).parent / "browser_lists"
+
+
+def _read_tsv(name):
+    f = LISTS / name
+    if not f.exists():
+        return []
+    rows = f.read_text(encoding="utf-8").splitlines()
+    head = rows[0].split("\t")
+    return [dict(zip(head, r.split("\t"))) for r in rows[1:] if r.strip()]
+
+
+_geo_cache = {}
+
+
+def geocode_locality(text):
+    """Approximate coordinates for a locality name via OpenStreetMap Nominatim (1 req/s)."""
+    parts = [p.strip() for p in re.split(r">+", text) if p.strip() and p.strip().lower() not in
+             ("nashik", "nasik", "india", "maharashtra", "thane", "front", "cornor", "signal")]
+    for loc in (parts[::-1] or ["Nashik"]):
+        q = f"{loc}, Nashik, Maharashtra, India"
+        if q not in _geo_cache:
+            txt = fetch.get("https://nominatim.openstreetmap.org/search?format=json&limit=1&q="
+                            + requests.utils.quote(q), check_robots=False, min_bytes=2,
+                            headers={"User-Agent": "NashikBedCensus/0.1"})
+            j = json.loads(txt) if txt else []
+            _geo_cache[q] = (float(j[0]["lat"]), float(j[0]["lon"])) if j else None
+        if _geo_cache[q]:
+            return _geo_cache[q]
+    return None, None
+
+
+def cleartrip_full():
+    out = []
+    rows = _read_tsv("cleartrip.tsv")
+    print(f"  cleartrip_full: {len(rows)} properties in browser list; fetching detail pages")
+    for r in rows:
+        url = f"https://www.cleartrip.com/hotels/details/{r['id']}"
+        html = fetch.get(url) or ""
+        m = re.search(r'"latLong":\{"lat":(-?[\d.]+),"lng":(-?[\d.]+)', html)
+        nm = re.search(r'"name":"([^"]+)","checkInDate"', html)
+        name = r["name"] or (nm.group(1) if nm else None)
+        if not name:
+            continue
+        t = r["type_locality"]
+        star = re.match(r"(\d)-star", t)
+        kind, _, loc = t.partition("·")
+        kind = re.sub(r"\d-star\s*", "", kind).strip().lower()
+        out.append(rec(source="cleartrip", source_id=r["id"], name=name, kind=kind,
+                       stars=float(star.group(1)) if star else None,
+                       lat=float(m.group(1)) if m else None, lon=float(m.group(2)) if m else None,
+                       locality=loc.strip(), url=url))
+    return out
+
+
+def easemytrip_full():
+    out = []
+    rows = _read_tsv("easemytrip.tsv")
+    print(f"  easemytrip_full: {len(rows)} properties in browser list")
+    for r in rows:
+        lat = lon = None
+        approx = False
+        url = None
+        if r["id"]:
+            url = f"https://www.easemytrip.com/hotels/hotel-{r['id']}/"
+            html = fetch.get(url) or ""
+            m = re.search(r'"latitude": ?"?(-?[\d.]+)"?,\s*"longitude": ?"?(-?[\d.]+)', html)
+            if m:
+                lat, lon = float(m.group(1)), float(m.group(2))
+        if lat is None:
+            lat, lon = geocode_locality(r["address"])
+            approx = lat is not None
+        out.append(rec(source="easemytrip", source_id=r["id"] or r["name"], name=r["name"], kind="hotel",
+                       lat=lat, lon=lon, address=r["address"].replace(">", ", "),
+                       locality=r["address"].split(">")[-1], url=url, approx=approx))
+    return out
+
+
+def booking_full():
+    """Booking.com result cards (collected in a browser). Cards carry no coordinates,
+    only distance from the city centre, which dedupe uses as a ring constraint."""
+    out = []
+    for r in _read_tsv("booking.tsv"):
+        m = re.match(r"([\d.]+)\s*(km|m)", r.get("dist_from_centre") or "")
+        ring = (float(m.group(1)) / (1000 if m.group(2) == "m" else 1)) if m else None
+        out.append(rec(source="booking", source_id=r["slug"], name=r["name"], kind="hotel",
+                       stars=_num(r.get("stars")), ring_km=ring,
+                       url=f"https://www.booking.com/hotel/in/{r['slug']}.html"))
+    print(f"  booking_full: {len(out)} properties in browser list (no coordinates)")
+    return out
+
+
+def _generic_list(source, fname):
+    """TSV collected in a browser with columns id, name, locality, lat, lon[, stars]."""
+    out = []
+    for r in _read_tsv(fname):
+        lat, lon = _num(r.get("lat")), _num(r.get("lon"))
+        approx = False
+        if lat is None and r.get("locality"):
+            lat, lon = geocode_locality(r["locality"])
+            approx = lat is not None
+        out.append(rec(source=source, source_id=r["id"] or r["name"], name=r["name"], kind=r.get("type") or "hotel",
+                       stars=_num(r.get("stars")), lat=lat, lon=lon, locality=r.get("locality"),
+                       approx=approx))
+    print(f"  {source}: {len(out)} properties in browser list")
+    return out
+
+
 # ---------------------------------------------------------------- OYO
 def oyo():
     seeds = ["https://www.oyorooms.com/hotels-in-nashik/",
@@ -224,59 +339,92 @@ def oyo():
 
 # ---------------------------------------------------------------- Google Places (optional)
 def google_places():
-    """Google Places API (New) Text Search over a grid. Needs GOOGLE_MAPS_API_KEY.
+    """Google Places API (New) Text Search. Needs GOOGLE_MAPS_API_KEY.
 
-    Cost guide: ~25 tiles x 8 queries x up to 3 pages ≈ 600 requests (a few USD at current pricing).
+    The area is cut into tiles; Google returns at most 60 results per search, so
+    any tile that hits 60 is split into four smaller tiles and searched again.
+    Phone numbers are not requested: that keeps every call in Google's cheaper
+    "Text Search Pro" tier. A hard cap (GOOGLE_MAX_REQUESTS) bounds the cost.
     """
     key = os.environ.get("GOOGLE_MAPS_API_KEY")
     if not key:
         print("  google: GOOGLE_MAPS_API_KEY not set -> skipped (biggest coverage gain if enabled)")
         return []
-    queries = ["hotel", "lodge", "dharamshala", "bhakta niwas", "guest house", "homestay",
-               "hostel", "ashram rooms"]
-    step = 0.06  # ~6.5 km tiles
-    lat_min, lat_max = LAT0 - 0.32, LAT0 + 0.32
-    lon_min, lon_max = LON0 - 0.34, LON0 + 0.34
+    max_req = int(os.environ.get("GOOGLE_MAX_REQUESTS", "3000"))
+    queries = ["hotel", "lodge", "dharamshala", "guest house", "homestay", "hostel", "ashram",
+               "bhakta niwas"]
+    lodging_types = {"lodging", "hotel", "motel", "hostel", "guest_house", "bed_and_breakfast",
+                     "resort_hotel", "inn", "campground", "extended_stay_hotel", "cottage",
+                     "private_guest_room", "farmstay", "japanese_inn", "budget_japanese_inn"}
     hdr = {"X-Goog-Api-Key": key, "Content-Type": "application/json",
            "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.location,"
-                               "places.types,places.primaryType,places.nationalPhoneNumber,nextPageToken"}
-    out = {}
-    lat = lat_min
-    while lat < lat_max:
-        lon = lon_min
-        while lon < lon_max:
-            for q in queries:
-                token = None
-                for _ in range(3):
-                    body = {"textQuery": q, "pageSize": 20, "locationRestriction": {"rectangle": {
-                        "low": {"latitude": lat, "longitude": lon},
-                        "high": {"latitude": lat + step, "longitude": lon + step}}}}
-                    if token:
-                        body["pageToken"] = token
-                    txt = fetch.get("https://places.googleapis.com/v1/places:searchText", method="POST",
-                                    json_body=body, headers=hdr, check_robots=False)
-                    if not txt:
-                        break
-                    j = json.loads(txt)
-                    for p in j.get("places", []):
-                        types = p.get("types", [])
-                        if not ({"lodging", "hotel", "motel", "hostel", "guest_house", "bed_and_breakfast",
-                                 "resort_hotel", "inn", "campground", "extended_stay_hotel",
-                                 "budget_japanese_inn", "cottage", "private_guest_room"} & set(types)
-                                or re.search(r"dharm|niwas|nivas|ashram|lodge", p["displayName"]["text"], re.I)):
-                            continue
-                        out[p["id"]] = rec(source="google", source_id=p["id"], name=p["displayName"]["text"],
-                                           kind=p.get("primaryType") or "lodging",
-                                           lat=p["location"]["latitude"], lon=p["location"]["longitude"],
-                                           address=p.get("formattedAddress"), phone=p.get("nationalPhoneNumber"),
-                                           url=f"https://www.google.com/maps/place/?q=place_id:{p['id']}")
-                    token = j.get("nextPageToken")
-                    if not token:
-                        break
-            lon += step
-        lat += step
+                               "places.types,places.primaryType,nextPageToken"}
+    out, used = {}, [0]
+
+    def search(q, lo_lat, lo_lon, hi_lat, hi_lon):
+        """All results for one query in one rectangle; returns how many came back."""
+        token, n = None, 0
+        for _ in range(3):  # Google pages: 3 x 20 = 60 max
+            if used[0] >= max_req:
+                return n
+            body = {"textQuery": q, "pageSize": 20, "locationRestriction": {"rectangle": {
+                "low": {"latitude": lo_lat, "longitude": lo_lon},
+                "high": {"latitude": hi_lat, "longitude": hi_lon}}}}
+            if token:
+                body["pageToken"] = token
+            used[0] += 1
+            txt = fetch.get("https://places.googleapis.com/v1/places:searchText", method="POST",
+                            json_body=body, headers=hdr, check_robots=False)
+            if not txt:
+                if fetch.last_status in (400, 401, 403):
+                    raise RuntimeError("Google refused the API key (see the error above)")
+                return n
+            j = json.loads(txt)
+            for p in j.get("places", []):
+                n += 1
+                name = p.get("displayName", {}).get("text", "")
+                if not (lodging_types & set(p.get("types", []))
+                        or re.search(r"dharm|niwas|nivas|ashram|lodg|yatri", name, re.I)):
+                    continue
+                out[p["id"]] = rec(source="google", source_id=p["id"], name=name,
+                                   kind=p.get("primaryType") or "lodging",
+                                   lat=p["location"]["latitude"], lon=p["location"]["longitude"],
+                                   address=p.get("formattedAddress"),
+                                   url=f"https://www.google.com/maps/place/?q=place_id:{p['id']}")
+            token = j.get("nextPageToken")
+            if not token:
+                return n
+        return n
+
+    def tile(q, lo_lat, lo_lon, size):
+        n = search(q, lo_lat, lo_lon, lo_lat + size, lo_lon + size)
+        if n >= 60 and size > 0.004:  # saturated: split into 4
+            h = size / 2
+            for dl in (0, h):
+                for dn in (0, h):
+                    tile(q, lo_lat + dl, lo_lon + dn, h)
+
+    step = 0.08  # ~9 km starting tiles
+    lat_min, lon_min = LAT0 - 0.32, LON0 - 0.34
+    for q in queries:
+        lat = lat_min
+        while lat < LAT0 + 0.32:
+            lon = lon_min
+            while lon < LON0 + 0.34:
+                tile(q, lat, lon, step)
+                lon += step
+            lat += step
+        print(f"  google: '{q}' done, {len(out)} lodging places so far, {used[0]} requests used")
+    if used[0] >= max_req:
+        print(f"  google: stopped at the request cap ({max_req}); raise GOOGLE_MAX_REQUESTS to go further")
     return list(out.values())
 
 
 ALL = {"osm": osm, "easemytrip": easemytrip, "cleartrip": cleartrip, "oyo": oyo,
+       "cleartrip_full": cleartrip_full, "easemytrip_full": easemytrip_full,
+       "booking": booking_full,
+       "makemytrip": lambda: _generic_list("makemytrip", "makemytrip.tsv"),
+       "goibibo": lambda: _generic_list("goibibo", "goibibo.tsv"),
+       "agoda": lambda: _generic_list("agoda", "agoda.tsv"),
+       "yatra": lambda: _generic_list("yatra", "yatra.tsv"),
        "google": google_places}

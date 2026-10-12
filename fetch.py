@@ -26,6 +26,7 @@ _session.headers.update({
     "Accept-Language": "en-IN,en;q=0.9",
 })
 _last_hit: dict[str, float] = {}
+last_status = None  # HTTP status of the most recent network request
 _robots: dict[str, urllib.robotparser.RobotFileParser | None] = {}
 
 
@@ -44,7 +45,7 @@ def _allowed(url: str) -> bool:
 
 
 def get(url: str, *, method="GET", data=None, json_body=None, headers=None,
-        use_cache=True, check_robots=True) -> str | None:
+        use_cache=True, check_robots=True, min_bytes=500) -> str | None:
     key = hashlib.sha1(json.dumps([method, url, data, json_body]).encode()).hexdigest()
     path = CACHE / key
     if use_cache and path.exists():
@@ -64,8 +65,12 @@ def get(url: str, *, method="GET", data=None, json_body=None, headers=None,
         return None
     finally:
         _last_hit[host] = time.time()
-    if r.status_code != 200 or len(r.content) < 500:
+    global last_status
+    last_status = r.status_code
+    if r.status_code != 200 or len(r.content) < min_bytes:
         print(f"  [skip] HTTP {r.status_code} ({len(r.content)} bytes): {url}")
+        if "json" in r.headers.get("content-type", ""):
+            print("         " + r.text[:300].replace("\n", " "))
         return None
     path.write_text(r.text, encoding="utf-8")
     return r.text

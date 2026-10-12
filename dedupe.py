@@ -33,6 +33,21 @@ def aliases(name: str) -> list[str]:
     return out or [re.sub(r"\W+", " ", name.lower()).strip()]
 
 
+# Words that describe a type of stay rather than identify one. Two names that share
+# only these ("Ambient Homestay" / "Asmita Homestay") are not the same place.
+GENERIC = set("""homestay homestays home homes stay stays villa villas apartment apartments apt flat
+guest house houses bungalow bunglow cottage cottages farm farmstay farmhouse room rooms suite suites
+service serviced inn palace comfort serene premium deluxe luxury luxe private family view mountain
+lake pool infinity 1bhk 2bhk 3bhk 4bhk 5bhk bhk bedroom bed beds city centre center near road
+retreat nature green express boutique heritage regency plaza elite classic international sai shree
+shri sri new hostel lodging boarding restaurant banquets spa vistas stayvista saffronstays veo
+nest cozy peaceful entire floor with by at in nasik""".split())
+
+
+def _core(x):
+    return {t for t in x.split() if t not in GENERIC}
+
+
 def name_sim(a: list[str], b: list[str]) -> float:
     best = 0.0
     for x in a:
@@ -40,9 +55,13 @@ def name_sim(a: list[str], b: list[str]) -> float:
             if not x or not y:
                 continue
             s = SequenceMatcher(None, x, y).ratio()
-            xs, ys = set(x.split()), set(y.split())
-            if xs <= ys or ys <= xs:  # one name is a subset of the other ("radhika" vs "radhika palace")
-                s = max(s, 0.88 if min(len(xs), len(ys)) >= 1 and min(len(x), len(y)) >= 5 else s)
+            cx, cy = _core(x), _core(y)
+            if cx and cy and not (cx & cy):
+                s = min(s, 0.6)  # no distinctive word in common
+            elif cx and cy and (cx <= cy or cy <= cx) and min(len(" ".join(cx)), len(" ".join(cy))) >= 4:
+                s = max(s, 0.88)  # distinctive words of one name contained in the other
+            elif not cx or not cy:
+                s = min(s, 0.8)  # one name is only generic words: never enough on its own
             best = max(best, s)
     return best
 
@@ -74,7 +93,7 @@ def dedupe(records):
         r["_al"] = aliases(r["name"])
         r["_ph"] = norm_phone(r.get("phone"))
     phone_freq = Counter(r["_ph"] for r in records if r["_ph"])
-    max_d = max(d for d, _ in config.DEDUP_RULES)
+    max_d = max([d for d, _ in config.DEDUP_RULES] + [4000])
 
     # spatial bucketing (~0.025 deg cells) to avoid O(n^2) over everything
     cells = defaultdict(list)
@@ -82,26 +101,43 @@ def dedupe(records):
         if r["lat"] is not None:
             cells[(int(r["lat"] / 0.025), int(r["lon"] / 0.025))].append(i)
 
-    pairs = []
+    pairs, cand = [], []
 
     def consider(i, j, dist):
         a, b = records[i], records[j]
-        if a["source"] == b["source"] and a["source"] != "osm":
-            return  # one OTA does not list the same hotel twice under different ids (OSM can: node + way)
+        same_listing_site = a["source"] == b["source"] and a["source"] != "osm" \
+            and a["source_id"] != b["source_id"] and not (a.get("approx") or b.get("approx"))  # one OTA does not list the same hotel twice under different ids (OSM can: node + way)
         s = name_sim(a["_al"], b["_al"])
         why = None
+        rules = config.DEDUP_RULES
+        if a.get("approx") or b.get("approx"):  # locality-level coordinates: wider radius, stricter names
+            rules = [(4000, 0.85)]
+        if same_listing_site:  # one site listing a property twice: only near-identical pins and names
+            rules = [(150, 0.95)]
         if dist is not None:
-            for d, t in config.DEDUP_RULES:
+            for d, t in rules:
                 if dist <= d and s >= t:
                     why = f"dist {dist:.0f}m, name {s:.2f}"
                     break
-        elif re.sub(r"\W+", "", a["name"].lower()) == re.sub(r"\W+", "", b["name"].lower()):
-            why = "no coords, identical name"
+        else:
+            # no coordinates (e.g. Booking.com): Booking gives distance from the centre,
+            # so the other record must sit on roughly the same ring around the city
+            ring = a.get("ring_km") if a.get("ring_km") is not None else b.get("ring_km")
+            other = b if a.get("lat") is None else a
+            if re.sub(r"\W+", "", a["name"].lower()) == re.sub(r"\W+", "", b["name"].lower()):
+                why = "no coords, identical name"
+            elif ring is not None and other.get("lat") is not None and s >= 0.88 \
+                    and abs(haversine((other["lat"], other["lon"]), config.CENTER) / 1000 - ring) <= 3:
+                why = f"no coords, name {s:.2f}, ~{ring:g} km from centre"
+            elif other.get("lat") is None and s >= 0.97:
+                why = f"no coords on either, name {s:.2f}"
+            elif ring is None and (s >= 0.97 or (s >= 0.92 and min(len(x) for x in a["_al"] + b["_al"]) >= 8)
+                                   or (s >= 0.88 and min(len(_core(x)) for x in a["_al"] + b["_al"]) >= 2)):
+                why = f"no coords, name {s:.2f}"
         if not why and a["_ph"] and a["_ph"] == b["_ph"] and phone_freq[a["_ph"]] <= 3:
             why = f"same phone {a['_ph']}"
         if why:
-            pairs.append((a["source"], a["name"], b["source"], b["name"], why))
-            parent[find(i)] = find(j)
+            cand.append((s, -(dist or 0), i, j, why))
 
     reach = int(max_d / 2700) + 1
     for (cx, cy), idx in cells.items():
@@ -113,11 +149,46 @@ def dedupe(records):
                     dist = haversine((records[i]["lat"], records[i]["lon"]), (records[j]["lat"], records[j]["lon"]))
                     if dist <= max_d:
                         consider(i, j, dist)
-    nocoord = [i for i, r in enumerate(records) if r["lat"] is None]
-    for i in nocoord:
-        for j in range(n):
+    # Records without coordinates (Booking, Agoda, Yatra, Goibibo): compare only with
+    # records sharing a distinctive name token, then apply the name rules in consider().
+    tok_count = Counter(t for r in records for t in set(" ".join(r["_al"]).split()))
+    index = defaultdict(set)
+    for j, r in enumerate(records):
+        for t in set(" ".join(r["_al"]).split()):
+            if tok_count[t] < 60:
+                index[t].add(j)
+    for i, r in enumerate(records):
+        if r["lat"] is not None:
+            continue
+        cands = set().union(*[index[t] for t in set(" ".join(r["_al"]).split()) if t in index] or [set()])
+        for j in cands:
             if j != i and (records[j]["lat"] is not None or j > i):
                 consider(i, j, None)
+
+    # Strongest matches first. A cluster may not hold two *different* listings from the
+    # same booking site unless their names are near-identical: sites rarely list one
+    # hotel twice, so such a merge almost always means two neighbouring places chained.
+    members = {i: [i] for i in range(n)}
+    for s, _, i, j, why in sorted(cand, reverse=True):
+        ri, rj = find(i), find(j)
+        if ri == rj:
+            continue
+        ok = True
+        for x in members[ri]:
+            for y in members[rj]:
+                a, b = records[x], records[y]
+                if a["source"] == b["source"] and a["source"] != "osm" and a["source_id"] != b["source_id"] \
+                        and name_sim(a["_al"], b["_al"]) < 0.95:
+                    ok = False
+                    break
+            if not ok:
+                break
+        if not ok:
+            continue
+        parent[ri] = rj
+        members[rj] += members.pop(ri)
+        a, b = records[i], records[j]
+        pairs.append((a["source"], a["name"], b["source"], b["name"], why))
 
     groups = defaultdict(list)
     for i in range(n):

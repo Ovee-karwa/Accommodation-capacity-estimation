@@ -7,3 +7,7 @@ output/*.html
 __pycache__/
 *.pyc
 .DS_Store
+# Run logs
+output/*.txt
+# Listings collected from booking sites (third-party data): kept locally, not published
+browser_lists/
